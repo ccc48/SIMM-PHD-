@@ -1,0 +1,372 @@
+function [w_update01,m_update1, P_update1, L_update01,LK01,...
+          w_update02,m_update2, P_update2, L_update02,LK02,...
+          w_update03,m_update03,P_update03,L_update03,LK03] = CVCTCAfilters(k,model,meas,est,filter,w0,m0,P0,L0)
+            %只有CV和CT的状态和协方差的输出需要扩到6维
+          % w_update03,m_update03,P_update03,L_update03,LK03,...
+          % est] = CVCTCAfilters(k,model,meas,est,filter,w0,m0,P0,L0)
+%=== Filtering 
+%取出
+%CV
+w01 = w0{1};m01 = m0{1};P01 = P0{1};L01 = L0{1};
+%CT
+w02 = w0{2};m02 = m0{2};P02 = P0{2};L02 = L0{2};
+%CA
+w03 = w0{3};m03 = m0{3};P03 = P0{3};L03 = L0{3};
+
+%% ---prediction
+%CV
+% fprintf('m01矩阵:\n');
+% disp(m01);
+% fprintf('P01矩阵:\n');
+% disp(P01);
+[m_predict01,P_predict01] = CV_kalman_predict(model,m01,P01);       %surviving components
+w_predict01= model.P_S*w01;                                                                  %surviving weights
+w_predict01= cat(1,model.w_birth,w_predict01);                                                   %append birth weights
+m_predict01= cat(2,model.m_birthCV,m_predict01); 
+P_predict01= cat(3,model.P_birthCV,P_predict01);            %append birth components                                                 
+L_predict01= model.L_birth+L01;                                                              %number of predicted components
+
+%CT 
+[m_predict02,P_predict02] = CT_ekf_predict(model,m02,P02);                          %surviving components
+w_predict02= model.P_S*w02;                                                                  %surviving weights
+w_predict02= cat(1,model.w_birth,w_predict02);
+m_predict02= cat(2,model.m_birthCT,m_predict02); 
+P_predict02= cat(3,model.P_birthCT,P_predict02);            %append birth components                                                      %append birth weights
+L_predict02= model.L_birth+L02;
+
+%CA
+[m_predict03,P_predict03] = CA_ekf_predict(model,m03,P03);                          %surviving components
+w_predict03= model.P_S*w03;                                                                  %surviving weights
+w_predict03= cat(1,model.w_birth,w_predict03);                                                      %append birth weights
+m_predict03= cat(2,model.m_birthCA,m_predict03); 
+P_predict03= cat(3,model.P_birthCA,P_predict03);            %append birth components
+L_predict03= model.L_birth+L03;
+%% ---gating
+%CV
+% fprintf('S矩阵前的P矩阵:\n');
+% for j=1:length(w_predict01)
+%     disp(m_predict01(:,j));
+%     disp(P_predict01(:,:,j));
+% end
+if filter.gate_flag
+    Z01 = CV_gate_meas_gms(meas.Z{k},filter.gamma,model,m_predict01,P_predict01);        
+end
+ 
+%CT
+if filter.gate_flag
+    Z02 = CT_gate_meas_ekf(meas.Z{k},filter.gamma,model,m_predict02,P_predict02);        
+end
+% Z02 = PoltoCar(Z02);
+%CA
+if filter.gate_flag
+    Z03 = CA_gate_meas(meas.Z{k},filter.gamma,model,m_predict03,P_predict03);        
+end
+
+Zall = [Z01 Z02 Z03];
+
+%取所有模型门控后的测量的并集
+[C, ic, ia] = unique(Zall(1,:), 'stable');% 使用 unique 函数找出唯一值，并获取索引信息
+Z_union = Zall(:, ic);
+
+%取所有模型门控后的测量的交集
+%数据是浮点数，需要四舍五入到一定小数位数，才能调用intersect
+%intersect默认处理整数或者字符数据，处理浮点数需注意精度问题
+% Z01 = round(Z01,5);
+% Z02 = round(Z02,5);
+% Z03 = round(Z03,5);
+% D = intersect(Z01', Z02', 'rows','stable');        % 转换为行形式并逐步求交集
+% Z_intersect = intersect(D, Z03', 'rows', 'stable')';
+
+%% ---update
+%number of measurements
+m= size(Z_union,2);
+ 
+%missed detection term漏检
+%CV
+w_update01 = model.Q_D*w_predict01;
+m_update01 = m_predict01;
+P_update01 = P_predict01;
+L_update01 = L_predict01;
+
+%CT
+w_update02 = model.Q_D*w_predict02;
+m_update02 = m_predict02;
+P_update02 = P_predict02;
+L_update02 = L_predict02;
+
+%CA
+w_update03 = model.Q_D*w_predict03;
+m_update03 = m_predict03;
+P_update03 = P_predict03;
+L_update03 = L_predict03;
+
+%检测
+if m~=0
+%m detection terms 
+%CV
+[qz_temp01,m_temp01,P_temp01] = CV_kalman_update_multiple(Z_union,model,m_predict01,P_predict01);
+    for ell=1:m
+        w_temp01 = model.P_D*w_predict01(:).*qz_temp01(:,ell); 
+        w_temp01 = w_temp01./(model.lambda_c*model.pdf_c + sum(w_temp01));
+        w_update01 = cat(1,w_update01,w_temp01);
+        m_update01 = cat(2,m_update01,m_temp01(:,:,ell));
+        P_update01 = cat(3,P_update01,P_temp01);
+        L_update01 = length(w_update01);
+    end
+
+%CT
+[qz_temp02,m_temp02,P_temp02] = CT_ekf_update(Z_union,model,m_predict02,P_predict02);
+    for ell=1:m
+        w_temp02 = model.P_D*w_predict02(:).*qz_temp02(:,ell); 
+        w_temp02 = w_temp02./(model.lambda_c*model.pdf_c + sum(w_temp02));
+        w_update02 = cat(1,w_update02,w_temp02);
+        m_update02 = cat(2,m_update02,m_temp02(:,:,ell));
+        P_update02 = cat(3,P_update02,P_temp02);
+        L_update02 = length(w_update02);
+    end
+
+%CA
+[qz_temp03,m_temp03,P_temp03] = CA_ekf_update(Z_union,model,m_predict03,P_predict03);
+    for ell=1:m
+        w_temp03 = model.P_D*w_predict03(:).*qz_temp03(:,ell); 
+        w_temp03 = w_temp03./(model.lambda_c*model.pdf_c + sum(w_temp03));
+        w_update03 = cat(1,w_update03,w_temp03);
+        m_update03 = cat(2,m_update03,m_temp03(:,:,ell));
+        P_update03 = cat(3,P_update03,P_temp03);
+        L_update03 = length(w_update03);
+    end
+
+end         
+            
+%% Likelihood
+%CV
+LK01 = CV_compute_likelihood(k,model,Z_union,est,m_predict01,P_predict01, w_predict01);
+%CT
+LK02 = CT_compute_likelihood(k,model,Z_union,est,m_predict02,P_predict02, w_predict02);
+%CA
+LK03 = CA_compute_likelihood(k,model,Z_union,est,m_predict03,P_predict03, w_predict03);
+    
+%% ---mixture management
+%CV
+L_posterior01 = length(w_update01); 
+    %pruning, merging, capping 
+[w_update01,m_update01,P_update01]= gaus_prune(w_update01,m_update01,P_update01,filter.elim_threshold);    
+L_prune01= length(w_update01);
+[w_update01,m_update01,P_update01]= gaus_merge_newnew(w_update01,m_update01,P_update01,filter.merge_threshold);   
+L_merge01= length(w_update01);
+[w_update01,m_update01,P_update01]= gaus_cap(w_update01,m_update01,P_update01,filter.L_max);
+L_cap01 = length(w_update01);
+L_update01 = L_cap01;
+
+%CT
+L_posterior02 = length(w_update02); 
+    %pruning, merging, capping 
+[w_update02,m_update02,P_update02]= gaus_prune(w_update02,m_update02,P_update02,filter.elim_threshold);    
+L_prune02= length(w_update02);
+[w_update02,m_update02,P_update02]= gaus_merge_newnew(w_update02,m_update02,P_update02,filter.merge_threshold);   
+L_merge02= length(w_update02);
+[w_update02,m_update02,P_update02]= gaus_cap(w_update02,m_update02,P_update02,filter.L_max);
+L_cap02 = length(w_update02);
+L_update02 = L_cap02;
+
+%CA
+L_posterior03 = length(w_update03); 
+    %pruning, merging, capping 
+[w_update03,m_update03,P_update03]= gaus_prune(w_update03,m_update03,P_update03,filter.elim_threshold);    
+L_prune03= length(w_update03);
+[w_update03,m_update03,P_update03]= gaus_merge_newnew(w_update03,m_update03,P_update03,filter.merge_threshold);   
+L_merge03= length(w_update03);
+[w_update03,m_update03,P_update03]= gaus_cap(w_update03,m_update03,P_update03,filter.L_max);
+L_cap03 = length(w_update03);
+L_update03 = L_cap03;
+
+% 找出最大的高斯分量数量
+max_GMs_mix = max([L_update01, L_update02, L_update03]);
+
+% 对 CV 模型进行处理
+if L_update01 < max_GMs_mix
+    % 填充零权重分量
+    num_to_add = max_GMs_mix - L_update01;
+    w_update01 = [w_update01; zeros(num_to_add, 1)];
+    m_update01 = [m_update01  zeros(size(m_update01, 1),num_to_add)];
+    P_update01 = cat(3,P_update01, zeros(size(m_update01, 1),size(m_update01, 1),num_to_add));
+end
+
+% 对 CT 模型进行处理
+if L_update02 < max_GMs_mix
+    num_to_add = max_GMs_mix - L_update02;
+    w_update02 = [w_update02; zeros(num_to_add, 1)];
+    m_update02 = [m_update02 zeros(size(m_update02, 1),num_to_add)];
+    P_update02 = cat(3,P_update02, zeros(size(m_update02, 1),size(m_update02, 1),num_to_add));
+end
+
+% 对 CA 模型进行处理
+if L_update03 < max_GMs_mix
+    num_to_add = max_GMs_mix - L_update03;
+    w_update03 = [w_update03; zeros(num_to_add, 1)];
+    m_update03 = [m_update03  zeros(size(m_update03, 1),num_to_add)];
+    P_update03 = cat(3,P_update03, zeros(size(m_update03, 1),size(m_update03, 1),num_to_add));
+end
+
+
+%% 扩维
+%% CV
+% expand X_2i from 4*n into 6*n
+Expand_Xi_x = padarray(m_update01([1 2],:),[1,0],'post');
+Expand_Xi_y = padarray(m_update01([3 4],:),[1,0],'post');
+m_update1 = [Expand_Xi_x;Expand_Xi_y];          
+
+% expand P2_CV from 4*4 into 6*6
+plength = length(w_update01);
+P_update1 = zeros(6, 6, plength);
+for Pii = 1:plength
+    tempP = P_update01(:,:,Pii);
+    Expand_P_1 = padarray(tempP([1 2],:),[1,0],'post');
+    Expand_P_2 = padarray(tempP([3 4],:),[1,0],'post');
+    Expand_P = [Expand_P_1;Expand_P_2];
+    Expand_P_4 = padarray(Expand_P(:,[1 2]),[0,1],'post');
+    Expand_P_5 = padarray(Expand_P(:,[3 4]),[0,1],'post');
+    P_update1(:,:,Pii) = [Expand_P_4 Expand_P_5];
+end
+
+
+%% CT
+% delete omega
+fprintf('m_update02');
+disp(m_update02);
+
+if size(m_update02,1)==5
+    m_update002 = [m_update02([1 2 3 4],:)];
+    P_update002 = P_update02(1:4, 1:4, :);
+end
+% expand X_2i from 4*n into 6*n
+Expand_Xi_x = padarray(m_update002([1 2],:),[1,0],'post');
+Expand_Xi_y = padarray(m_update002([3 4],:),[1,0],'post');
+m_update2 = [Expand_Xi_x;Expand_Xi_y];
+
+% expand P2_CV from 4*4 into 6*6
+plength = length(w_update02);
+P_update2 = zeros(6, 6, plength);
+for Pii = 1:plength
+    tempP = P_update01(:,:,Pii);
+    Expand_P_1 = padarray(tempP([1 2],:),[1,0],'post');
+    Expand_P_2 = padarray(tempP([3 4],:),[1,0],'post');
+    Expand_P = [Expand_P_1;Expand_P_2];
+    Expand_P_4 = padarray(Expand_P(:,[1 2]),[0,1],'post');
+    Expand_P_5 = padarray(Expand_P(:,[3 4]),[0,1],'post');
+    P_update2(:,:,Pii) = [Expand_P_4 Expand_P_5];
+end
+
+
+%% --- state extraction
+% %CV
+% idx= find(w_update01 > 0.5 );
+% P1 = [];
+% for j=1:length(idx)
+%     repeat_num_targets= round(w_update01(idx(j)));
+%     est.W{k,1}= [ est.W{k,1}; repmat(w_update01(idx(j),:),[repeat_num_targets,1]) ];
+%     est.X{k,1}= [ est.X{k,1} repmat(m_update01(:,idx(j)),[1,repeat_num_targets]) ];
+%     for rll = 1:repeat_num_targets
+%         P = P_update01(:,:,idx(j)) ;
+%         P1 = cat(3,P1,P);
+%     end
+%     est.N(k,1)= est.N(k,1)+repeat_num_targets;
+%     est.L{k,1}= [];
+% end
+% est.P{k,1} = P1;
+% 
+% %CT
+% idx= find(w_update02 > 0.5 );
+% P1 = [];
+% for j=1:length(idx)
+%     repeat_num_targets= round(w_update02(idx(j)));
+%     est.W{k,2}= [ est.W{k,2}; repmat(w_update02(idx(j),:),[repeat_num_targets,1]) ];
+%     est.X{k,2}= [ est.X{k,2} repmat(m_update02(:,idx(j)),[1,repeat_num_targets]) ];
+%     for rll = 1:repeat_num_targets
+%         P = P_update02(:,:,idx(j)) ;
+%         P1 = cat(3,P1,P);
+%     end    
+%     est.N(k,2)= est.N(k,2)+repeat_num_targets;
+%     est.L{k,2}= [];
+% 
+% end
+% est.P{k,2} = P1;
+% 
+% %CA
+% idx= find(w_update03 > 0.5 );
+% P1 = [];
+% for j=1:length(idx)
+%     repeat_num_targets= round(w_update03(idx(j)));
+%     est.W{k,3}= [ est.W{k,3} ;repmat(w_update03(idx(j),:),[repeat_num_targets,1]) ];
+%     est.X{k,3}= [ est.X{k,3} repmat(m_update03(:,idx(j)),[1,repeat_num_targets]) ];
+%     for rll = 1:repeat_num_targets
+%         P = P_update03(:,:,idx(j)) ;
+%         P1 = cat(3,P1,P);
+%     end
+%     est.N(k,3)= est.N(k,3)+repeat_num_targets;
+%     est.L{k,3}= [];
+% 
+%     end
+% est.P{k,3} = P1;
+
+% 可能某个模型没有>0.5的权重，提取后为空
+% 这样不同模型提取后的GM分量数量不一致
+% 为保证一致
+% 找出所有模型中最大的高斯分量数量
+% max_GMs = max([est.N(k,1), est.N(k,2), est.N(k,3)]);
+
+% 补齐分量：对分量数量不足的模型，使用权重最小且大于 0 的高斯分量进行补齐，
+% 直到达到最大数量或者没有可用分量为止
+% 注意，这种补齐方式可能会引入一些噪声，因为使用的是权重较小的分量
+% 补齐CV模型
+% while est.N(k,1) < max_GMs
+%     [min_weight, min_idx] = min(w_update01);
+%     if min_weight > 0
+%         repeat_num_targets = 1;
+%         est.W{k,1}= [ est.W{k,1}; repmat(w_update01(min_idx,:),[repeat_num_targets,1]) ];
+%         est.X{k,1}= [ est.X{k,1} repmat(m_update01(:,min_idx),[1,repeat_num_targets]) ];
+%         P = P_update01(:,:,min_idx) ;
+%         est.P{k,1} = cat(3,est.P{k,1},P);
+%         est.N(k,1)= est.N(k,1)+repeat_num_targets;
+%         w_update01(min_idx) = 0; % 避免重复使用
+%     else
+%         break; % 没有可用的分量了
+%     end
+% end
+% 
+% % 补齐CT模型
+% while est.N(k,2) < max_GMs
+%     [min_weight, min_idx] = min(w_update02);
+%     if min_weight > 0
+%         repeat_num_targets = 1;
+%         est.W{k,2}= [ est.W{k,2}; repmat(w_update02(min_idx,:),[repeat_num_targets,1]) ];
+%         est.X{k,2}= [ est.X{k,2} repmat(m_update02(:,min_idx),[1,repeat_num_targets]) ];
+%         P = P_update02(:,:,min_idx) ;
+%         est.P{k,2} = cat(3,est.P{k,2},P);
+%         est.N(k,2)= est.N(k,2)+repeat_num_targets;
+%         w_update02(min_idx) = 0; % 避免重复使用
+%     else
+%         break; % 没有可用的分量了
+%     end
+% end
+% 
+% % 补齐CA模型
+% while est.N(k,3) < max_GMs
+%     [min_weight, min_idx] = min(w_update03);
+%     if min_weight > 0
+%         repeat_num_targets = 1;
+%         est.W{k,3}= [ est.W{k,3}; repmat(w_update03(min_idx,:),[repeat_num_targets,1]) ];
+%         est.X{k,3}= [ est.X{k,3} repmat(m_update03(:,min_idx),[1,repeat_num_targets]) ];
+%         P = P_update03(:,:,min_idx) ;
+%         est.P{k,3} = cat(3,est.P{k,3},P);
+%         est.N(k,3)= est.N(k,3)+repeat_num_targets;
+%         w_update03(min_idx) = 0; % 避免重复使用
+%     else
+%         break; % 没有可用的分量了
+%     end
+% end
+
+end
+    
+ 
+
